@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+MNT="/mnt"
+ESP_SIZE="1GiB"
+TIMEOUT=3
+EXTRA_PARAMS="rw quiet"
+FILESYSTEMS=(ext4 btrfs xfs f2fs)
+PACKAGES=(base linux linux-firmware mkinitcpio networkmanager nano sudo git)
+
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; N=$'\e[0m'
+info() { echo "${B}[INFO]${N} $*"; }
+ok()   { echo "${G}[ OK ]${N} $*"; }
+warn() { echo "${Y}[WARN]${N} $*"; }
+die()  { echo "${R}[ERR ]${N} $*" >&2; exit 1; }
+
+trap 'die "Installation failed at line $LINENO. Command: $BASH_COMMAND"' ERR
+
+usage() {
+    cat <<EOF
+Usage:
+  ./install list    List all available drives
+  ./install sda     Install to /dev/sda (SATA)
+  ./install nvme    Install to /dev/nvme0n1 (NVMe)
+EOF
+}
+
+list_disks() {
+    lsblk -d -e 7,11 -o NAME,SIZE,TRAN,MODEL
+}
+
+read_password() {
+    local label="$1" p1 p2
+    while true; do
+        read -rsp "Password for ${label}: " p1; echo
+        read -rsp "Repeat password for ${label}: " p2; echo
+        if [[ -z "$p1" ]]; then
+            warn "Password must not be empty."
+        elif [[ "$p1" != "$p2" ]]; then
+            warn "Passwords do not match, try again."
+        else
+            break
+        fi
+    done
+    REPLY_PW="$p1"
+}
+
+case "${1:-}" in
+    list)  list_disks; exit 0 ;;
+    nvme)  DISK="/dev/nvme0n1" ;;
+    sda)   DISK="/dev/sda" ;;
+    sd[a-z]|vd[a-z]|nvme[0-9]n[0-9]) DISK="/dev/$1" ;;
+    *)     usage; exit 1 ;;
+esac
+
+[[ $EUID -eq 0 ]] || die "Run as root."
+[[ -d /sys/firmware/efi/efivars ]] || die "System is not booted in UEFI mode (systemd-boot requires UEFI)."
+[[ -b "$DISK" ]] || die "Drive $DISK not found. Run './install list' to see available drives."
+
+for cmd in pacstrap arch-chroot genfstab sfdisk wipefs mkfs.fat blkid curl; do
+    command -v "$cmd" >/dev/null || die "Command '$cmd' not found (run this from the Arch ISO)."
+done
+
+if mountpoint -q "$MNT"; then
+    umount -R "$MNT"
+fi
+if lsblk -nrpo MOUNTPOINTS "$DISK" | grep -q .; then
+    die "$DISK is in use (a partition is mounted). Is this the live ISO drive?"
+fi
+
+curl -fsI --max-time 15 https://archlinux.org >/dev/null \
+    || die "No internet connection (archlinux.org is unreachable)."
+
+echo
+while true; do
+    read -rp "Username for the new user: " USERNAME
+    if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$USERNAME" != "root" ]]; then
+        break
+    fi
+    warn "Invalid username (lowercase letters, digits, _ or -; must start with a letter or _; cannot be 'root')."
+done
+
+read_password "user '${USERNAME}'"; USER_PW="$REPLY_PW"
+read_password "root";               ROOT_PW="$REPLY_PW"
+
+echo
+FS=""
+while [[ -z "$FS" ]]; do
+    echo "Choose a root filesystem:"
+    for i in "${!FILESYSTEMS[@]}"; do
+        echo "  $((i + 1))) ${FILESYSTEMS[$i]}"
+    done
+    read -rp "Selection [1]: " choice
+    choice="${choice:-1}"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILESYSTEMS[@]} )); then
+        FS="${FILESYSTEMS[choice - 1]}"
+    else
+        for f in "${FILESYSTEMS[@]}"; do
+            [[ "$choice" == "$f" ]] && FS="$f"
+        done
+    fi
+    [[ -n "$FS" ]] || warn "Invalid selection."
+done
+command -v "mkfs.${FS}" >/dev/null || die "Command 'mkfs.${FS}' not found on this ISO."
+
+echo
+lsblk -o NAME,SIZE,TYPE,MODEL "$DISK"
+info "Root filesystem: ${FS}"
+warn "ALL DATA on $DISK will be ERASED."
+read -rp "Type 'yes' to continue: " CONFIRM
+[[ "$CONFIRM" == "yes" ]] || die "Aborted."
+
+info "Creating GPT layout on $DISK (ESP ${ESP_SIZE} + ${FS} root)..."
+wipefs -af "$DISK" >/dev/null
+sfdisk "$DISK" >/dev/null <<EOF
+label: gpt
+,${ESP_SIZE},C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+,,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+EOF
+
+if [[ "$DISK" =~ [0-9]$ ]]; then
+    ESP_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
+else
+    ESP_PART="${DISK}1";  ROOT_PART="${DISK}2"
+fi
+
+udevadm settle
+for _ in $(seq 1 20); do
+    [[ -b "$ESP_PART" && -b "$ROOT_PART" ]] && break
+    sleep 0.5
+done
+[[ -b "$ESP_PART" && -b "$ROOT_PART" ]] || die "New partitions did not appear: $ESP_PART / $ROOT_PART"
+
+info "Formatting partitions..."
+mkfs.fat -F 32 "$ESP_PART" >/dev/null
+case "$FS" in
+    ext4)  mkfs.ext4  -F -q "$ROOT_PART" ;;
+    btrfs) mkfs.btrfs -f -q "$ROOT_PART" ;;
+    xfs)   mkfs.xfs   -f -q "$ROOT_PART" ;;
+    f2fs)  mkfs.f2fs  -f -q "$ROOT_PART" ;;
+esac
+
+info "Mounting partitions at $MNT..."
+mount "$ROOT_PART" "$MNT"
+mount --mkdir "$ESP_PART" "$MNT/boot"
+ok "Partitions ready."
+
+timedatectl set-ntp true || warn "Could not enable NTP, continuing."
+
+UCODE_IMG=""
+case "$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')" in
+    GenuineIntel) PACKAGES+=(intel-ucode); UCODE_IMG="intel-ucode.img" ;;
+    AuthenticAMD) PACKAGES+=(amd-ucode);   UCODE_IMG="amd-ucode.img" ;;
+    *) warn "Unknown CPU vendor, skipping microcode." ;;
+esac
+
+case "$FS" in
+    btrfs) PACKAGES+=(btrfs-progs) ;;
+    xfs)   PACKAGES+=(xfsprogs) ;;
+    f2fs)  PACKAGES+=(f2fs-tools) ;;
+esac
+
+info "Installing packages: ${PACKAGES[*]}"
+pacstrap -K "$MNT" "${PACKAGES[@]}"
+genfstab -U "$MNT" > "$MNT/etc/fstab"
+ok "Base system installed."
+
+info "Configuring locale (en_US.UTF-8)..."
+sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' "$MNT/etc/locale.gen"
+grep -q '^en_US\.UTF-8 UTF-8' "$MNT/etc/locale.gen" || die "Failed to uncomment en_US.UTF-8 in locale.gen."
+arch-chroot "$MNT" locale-gen
+echo "LANG=en_US.UTF-8" > "$MNT/etc/locale.conf"
+
+info "Creating user '${USERNAME}' and setting passwords..."
+arch-chroot "$MNT" useradd -m -G wheel -s /bin/bash "$USERNAME"
+printf '%s:%s\n' "$USERNAME" "$USER_PW" | arch-chroot "$MNT" chpasswd
+printf 'root:%s\n' "$ROOT_PW" | arch-chroot "$MNT" chpasswd
+
+printf '%s\n' "%wheel ALL=(ALL:ALL) ALL" > "$MNT/etc/sudoers.d/wheel"
+chmod 440 "$MNT/etc/sudoers.d/wheel"
+
+arch-chroot "$MNT" systemctl enable NetworkManager
+
+info "Installing systemd-boot..."
+ROOT_UUID="$(blkid -s UUID -o value "$ROOT_PART")"
+[[ -n "$ROOT_UUID" ]] || die "Root UUID is empty."
+[[ -e "$MNT/boot/vmlinuz-linux" ]] || die "Kernel vmlinuz-linux not found in $MNT/boot."
+
+arch-chroot "$MNT" bootctl install
+arch-chroot "$MNT" systemctl enable systemd-boot-update.service || warn "Could not enable systemd-boot-update.service"
+
+mkdir -p "$MNT/boot/loader/entries"
+cat > "$MNT/boot/loader/loader.conf" <<EOF
+default  arch.conf
+timeout  ${TIMEOUT}
+console-mode max
+editor   no
+EOF
+
+write_entry() {
+    {
+        echo "title   $2"
+        echo "linux   /vmlinuz-linux"
+        [[ -n "$UCODE_IMG" && -e "$MNT/boot/${UCODE_IMG}" ]] && echo "initrd  /${UCODE_IMG}"
+        echo "initrd  /$3"
+        echo "options root=UUID=${ROOT_UUID} ${EXTRA_PARAMS}"
+    } > "$MNT/boot/loader/entries/$1"
+}
+
+write_entry "arch.conf" "Arch Linux" "initramfs-linux.img"
+if [[ -e "$MNT/boot/initramfs-linux-fallback.img" ]]; then
+    write_entry "arch-fallback.conf" "Arch Linux (fallback initramfs)" "initramfs-linux-fallback.img"
+fi
+ok "Bootloader installed."
+
+sync
+umount -R "$MNT"
+ok "Installation complete. Rebooting now (remove the live USB if needed)..."
+sleep 3
+reboot
